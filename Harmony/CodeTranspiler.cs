@@ -5,6 +5,7 @@ using System.Reflection;
 using System.Reflection.Emit;
 using System;
 using System.Collections;
+using System.Diagnostics;
 
 namespace Harmony
 {
@@ -25,54 +26,24 @@ namespace Harmony
 			transpilers.Add(transpiler);
 		}
 
-		private static object ConvertBlock(object originalBlock, Type type)
-		{
-			var block = Activator.CreateInstance(type);
-			Traverse.IterateFields(originalBlock, block, (trvFrom, trvDest) => trvDest.SetValue(trvFrom.GetValue()));
-			return block;
-		}
-
-		private static object ConvertBlocks(object originalBlocks, Type type)
-		{
-			var enumerableAssembly = type.GetGenericTypeDefinition().Assembly;
-			var genericListType = enumerableAssembly.GetType(typeof(List<>).FullName);
-			var elementType = type.GetGenericArguments()[0];
-			var listType = enumerableAssembly.GetType(genericListType.MakeGenericType(new Type[] { elementType }).FullName);
-			var blocks = Activator.CreateInstance(listType);
-			var listAdd = blocks.GetType().GetMethod("Add");
-			foreach (var originalBlock in originalBlocks as IEnumerable)
-			{
-				var block = ConvertBlock(originalBlock, elementType);
-				listAdd.Invoke(blocks, new object[] { block });
-			}
-			return blocks;
-		}
-
 		[UpgradeToLatestVersion(1)]
 		public static object ConvertInstruction(Type type, object op, out Dictionary<string, object> unassigned)
 		{
-			var elementTo = Activator.CreateInstance(type, new object[] { OpCodes.Nop, null });
 			var nonExisting = new Dictionary<string, object>();
-			Traverse.IterateFields(op, elementTo, (name, trvFrom, trvDest) =>
+			var elementTo = AccessTools.MakeDeepCopy(op, type, (namePath, trvSrc, trvDest) =>
 			{
-				var val = trvFrom.GetValue();
+				var value = trvSrc.GetValue();
 
 				if (trvDest.FieldExists() == false)
 				{
-					nonExisting[name] = val;
-					return;
+					nonExisting[namePath] = value;
+					return null;
 				}
 
-				// TODO - improve the logic here. for now, we replace all short jumps
-				//        with long jumps regardless of how far the jump is
-				//
-				if (name == nameof(CodeInstruction.opcode))
-					val = ReplaceShortJumps((OpCode)val);
+				if (namePath == nameof(CodeInstruction.opcode))
+					return ReplaceShortJumps((OpCode)value);
 
-				if (name == nameof(ILInstruction.blocks))
-					val = ConvertBlocks(val, trvDest.GetValueType());
-
-				trvDest.SetValue(val);
+				return value;
 			});
 			unassigned = nonExisting;
 			return elementTo;
@@ -204,24 +175,35 @@ namespace Harmony
 		}
 
 		[UpgradeToLatestVersion(1)]
-		public static IEnumerable<CodeInstruction> ConvertToOurInstructions(IEnumerable instructions, List<object> originalInstructions, Dictionary<object, Dictionary<string, object>> unassignedValues)
+		public static IEnumerable ConvertToOurInstructions(IEnumerable instructions, List<object> originalInstructions, Dictionary<object, Dictionary<string, object>> unassignedValues)
 		{
-			var result = new List<CodeInstruction>();
+			// Since we are patching this method, we cannot use typeof(CodeInstruction)
+			// because that would use the CodeInstruction of the Harmony lib that patches
+			// us and we get a type assignment error.
+			// Instead, we know that our caller returns List<X> where X is the type we need
+			//
+			var codeInstructionType = new StackTrace().GetFrames()
+				.Select(frame => frame.GetMethod())
+				.OfType<MethodInfo>()
+				.Select(method =>
+				{
+					var returnType = method.ReturnType;
+					if (returnType.IsGenericType == false) return null;
+					var listTypes = returnType.GetGenericArguments();
+					if (listTypes.Length != 1) return null;
+					var type = listTypes[0];
+					return type.FullName == typeof(CodeInstruction).FullName ? type : null;
+				})
+				.Where(type => type != null)
+				.First();
+
 			var newInstructions = instructions.Cast<object>().ToList();
 
 			var index = -1;
 			foreach (var op in newInstructions)
 			{
 				index++;
-
-				var elementTo = new CodeInstruction(OpCodes.Nop, null);
-				Traverse.IterateFields(op, elementTo, (name, trvFrom, trvDest) =>
-				{
-					var val = trvFrom.GetValue();
-					if (name == nameof(ILInstruction.blocks))
-						val = ConvertBlocks(val, trvDest.GetValueType());
-					trvDest.SetValue(val);
-				});
+				var elementTo = AccessTools.MakeDeepCopy(op, codeInstructionType);
 				if (unassignedValues.TryGetValue(op, out var fields))
 				{
 					var addExceptionInfo = ShouldAddExceptionInfo(op, index, originalInstructions, newInstructions, unassignedValues);
